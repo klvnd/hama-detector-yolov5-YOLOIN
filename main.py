@@ -11,7 +11,7 @@ import serial
 arduino_port = serial.Serial('COM7', 9600)
 
 # Telegram bot token
-telegram_bot_token = '6969277855:AAFKYPJk9FVMDzWPghbAX4Azr35LhqdqJTY'
+telegram_bot_token = '6786434209:AAH8evnaYbeRsi9wRNmonygEn68JknT7F4s'
 
 # Telegram chat ID
 telegram_chat_id = 1079574772  # to check id = https://api.telegram.org/bot<TOKEN>/getUpdates
