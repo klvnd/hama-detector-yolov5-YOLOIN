@@ -6,9 +6,28 @@ import telepot
 import io
 import threading
 import serial
+import mysql.connector
+from datetime import datetime
+from telepot.exception import TooManyRequestsError
+import time
+from mysql.connector import pooling
+
+# Initialize MySQL connection pool
+db_connection_pool = pooling.MySQLConnectionPool(
+    pool_name="mypool",
+    pool_size=5,
+    host="localhost",
+    user="root",
+    password="",
+    database="pysql"
+)
+
+# Function to get a connection from the pool
+def get_db_connection():
+    return db_connection_pool.get_connection()
 
 # Arduino port
-arduino_port = serial.Serial('COM7', 9600)
+arduino_port = serial.Serial('COM6', 9600)
 
 # Telegram bot token
 telegram_bot_token = '6786434209:AAH8evnaYbeRsi9wRNmonygEn68JknT7F4s'
@@ -32,36 +51,12 @@ model = torch.hub.load('ultralytics/yolov5', 'yolov5s', pretrained=True)
 # Using video file
 cap = cv2.VideoCapture("Test Videos/bird.mp4")
 
-# Using the webcam (index 0)
-# cap = cv2.VideoCapture(0)
-
 target_classes = ['bird']
 count = 0
+bird_detected = False  # Flag to track if a bird is detected
+telegram_message_sent = False  # Flag to track if Telegram message has been sent
 
 number_of_photos = 3
-
-#Polygon points
-pts = []
-
-# Function to draw polygon
-def draw_polygon(event, x, y, flags, param):
-    global pts
-    if event == cv2.EVENT_LBUTTONDOWN:
-        print(x,y)
-        pts.append([x, y])
-    elif event == cv2.EVENT_RBUTTONDOWN:
-        pts = []
-    
-# Function to check if a point is inside a polygon
-def inside_polygon(point,polygon):
-    result = cv2.pointPolygonTest(polygon, (point[0], point[1]), False)
-    if result == 1:
-        return True
-    else:
-        return False
-
-cv2.namedWindow('Video')
-cv2.setMouseCallback('Video', draw_polygon)
 
 def preprocess(img):
     height, width = img.shape[:2]
@@ -73,16 +68,30 @@ def preprocess(img):
 def send_telegram_message():
     global count
     global frame_detected
+    global telegram_message_sent
 
-    # Send a message to Telegram.
-    bot.sendMessage(telegram_chat_id, "Bird detected! ")
+    if not telegram_message_sent:
+        try:
+            # Send a message to Telegram.
+            bot.sendMessage(telegram_chat_id, "Bird detected!")
+            telegram_message_sent = True  # Set the flag to indicate the message has been sent
 
-    # Send a message to Telegram along with the detected photo.
-    # bot.sendPhoto(telegram_chat_id, photo=open("Detected Photos/detected" + str(count) + ".jpg", 'rb'))
+            # Simpan data ke MySQL ketika burung terdeteksi
+            current_time = datetime.now().strftime("%H:%M:%S")
+            current_date = datetime.now().strftime("%Y-%m-%d")
+            current_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            
+            # Modify this query to insert real-time data
+            insert_query = "INSERT INTO `detect` (`date_added`, `time_added`, `timestamp_added`, `data_column`) VALUES (%s, %s, %s, %s)"
+            with get_db_connection() as db_conn:
+                with db_conn.cursor() as db_cursor:
+                    db_cursor.execute(insert_query, (current_date, current_time, current_timestamp, 'burung terdeteksi'))
+                db_conn.commit()
 
-    # Saving the detected image
-    # if count < number_of_photos:
-    #     cv2.imwrite("Detected Photos/detected" + str(count) + ".jpg", frame_detected)
+        except TooManyRequestsError:
+            print("Too Many Requests. Waiting for a while.")
+            time.sleep(5)  # You can adjust the waiting time here
+            send_telegram_message()  # Retry the function
 
 while True:
     ret, frame = cap.read()
@@ -90,7 +99,8 @@ while True:
     frame = preprocess(frame)
     results = model(frame)
 
-    # using panda to get the detected objects' data
+    bird_detected = False  # Reset the flag for each frame
+
     for index, row in results.pandas().xyxy[0].iterrows():
         center_x = None
         center_y = None
@@ -101,7 +111,7 @@ while True:
             y1 = int(row['ymin'])
             x2 = int(row['xmax'])
             y2 = int(row['ymax'])
-            
+
             center_x = int((x1 + x2) / 2)
             center_y = int((y1 + y2) / 2)
 
@@ -112,48 +122,32 @@ while True:
             # draw center
             cv2.circle(frame, (center_x, center_y), 5, (0, 0, 255), -1)
 
-            # stop the alarm if the object is not in the area or if the object is not a bird
-            if center_x is None or center_y is None or name != 'bird':
-                pygame.mixer.music.stop()
-                alarm_playing = False
+            if name == 'bird':
+                bird_detected = True  # if a bird is detected
 
-        # Drawing the polygon
-        if len(pts) >= 4:
-            frame_copy = frame.copy()
-            cv2.fillPoly(frame_copy, np.array([pts]), (0, 255, 0))
-            frame = cv2.addWeighted(frame_copy, 0.1, frame, 0.9, 0)
-            if center_x is not None and center_y is not None:
+    # Play or stop the alarm based on the bird detection
+    if bird_detected:
+        if not pygame.mixer.music.get_busy():  # Check if the mixer is not already playing
+            pygame.mixer.music.play()
+        # Send a signal to Arduino
+        signal_to_arduino = "BIRD_DETECTED\n"  
+        arduino_port.write(signal_to_arduino.encode())
+        # Send a message to Telegram
+        alarm_thread = threading.Thread(target=send_telegram_message)
+        alarm_thread.start()
+        count += 1
 
-                #Checking if the center of the object is inside the polygon and if the object is a bird
-                if inside_polygon((center_x, center_y), np.array([pts])) and name == 'bird':
-                    mask = np.zeros_like(frame_detected)
-                    points = np.array([[x1, y1], [x1, y2], [x2, y2], [x2, y1]])
-                    points = points.reshape((-1, 1, 2))
-                    mask = cv2.fillPoly(mask, [points], (255, 255, 255))             
-                    frame_detected = cv2.bitwise_and(frame_detected, mask)
+        # Add warning text on the screen
+        warning_text = "Bird Detected!"
+        cv2.putText(frame, warning_text, (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+    else:
+        pygame.mixer.music.stop()
+        telegram_message_sent = False  # Reset the flag if no bird is detected
 
-                    # Playing the alarm
-                    if not pygame.mixer.music.get_busy():
-                        # Send signal to Arduino
-                        signal_to_arduino = "BIRD_DETECTED\n"  
-                        arduino_port.write(signal_to_arduino.encode())
-                        pygame.mixer.music.play()
-                        alarm_thread = threading.Thread(target=send_telegram_message)
-                        alarm_thread.start()
-                        alarm_playing = True
-                    cv2.putText(frame, "Target", (center_x, center_y), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-                    cv2.putText(frame, "Bird Detected", (20, 20), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 3)
-                    count += 1
-                    
-                else:
-                    # if the object is not in the area, stop the alarm 
-                    pygame.mixer.music.stop()
-                    alarm_playing = False
-                
     cv2.imshow("Video", frame)
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
 
-cap.release()
+# Menutup koneksi ke MySQL saat program berakhir
+db_connection_pool.close()
 cv2.destroyAllWindows()
